@@ -36,38 +36,18 @@ export class AudioRecorder {
   public async start() {
     const startTime = Date.now();
 
-    // Check if we need to recreate - either missing components OR components in bad state
-    const needsRecreate =
-      !this._context ||
-      !this._stream ||
-      !this._source ||
-      !this._recorder ||
-      this._context.state === 'closed' ||
-      this._stream.getTracks()[0]?.readyState === 'ended';
-
-    if (needsRecreate) {
-      info(`${needsRecreate ? 'Creating' : 'Recreating'} audio context (context state: ${this._context?.state}, track state: ${this._stream?.getTracks()[0]?.readyState})...`);
-      try {
-        // Clean up old resources if they exist
-        if (this._context || this._stream || this._source || this._recorder) {
-          this.close();
-        }
-        await this._createContext();
-      } catch (err: any) {
-        error(`Error creating context: ${err}`);
-        this._active = false;
+    // ALWAYS recreate audio context to avoid suspend/resume delays
+    // Reusing context causes 5-8 second delays in chunk arrival on webkit2gtk
+    info(`Recreating audio context (old state: ${this._context?.state})...`);
+    try {
+      // Clean up old resources if they exist
+      if (this._context || this._stream || this._source || this._recorder) {
+        this.close();
       }
-    } else {
-      info(`Reusing existing audio context (state: ${this._context.state})`);
-      this._active = true; // Set BEFORE resume to avoid dropping early chunks
-
-      const enableStart = Date.now();
-      this._stream.getTracks()[0].enabled = true;
-      info(`Track enabled in ${Date.now() - enableStart}ms`);
-
-      const resumeStart = Date.now();
-      await this._context.resume();
-      info(`Context resumed in ${Date.now() - resumeStart}ms, new state: ${this._context.state}`);
+      await this._createContext();
+    } catch (err: any) {
+      error(`Error creating context: ${err}`);
+      this._active = false;
     }
 
     info(`AudioRecorder.start() completed in ${Date.now() - startTime}ms`);
