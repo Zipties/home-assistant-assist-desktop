@@ -34,26 +34,47 @@ export class AudioRecorder {
   }
 
   public async start() {
-    if (!this._context || !this._stream || !this._source || !this._recorder) {
+    // Check if we need to recreate - either missing components OR components in bad state
+    const needsRecreate =
+      !this._context ||
+      !this._stream ||
+      !this._source ||
+      !this._recorder ||
+      this._context.state === 'closed' ||
+      this._stream.getTracks()[0]?.readyState === 'ended';
+
+    if (needsRecreate) {
+      info(`${needsRecreate ? 'Creating' : 'Recreating'} audio context (context state: ${this._context?.state}, track state: ${this._stream?.getTracks()[0]?.readyState})...`);
       try {
+        // Clean up old resources if they exist
+        if (this._context || this._stream || this._source || this._recorder) {
+          this.close();
+        }
         await this._createContext();
       } catch (err: any) {
         error(`Error creating context: ${err}`);
         this._active = false;
       }
     } else {
+      info(`Reusing existing audio context (state: ${this._context.state})`);
       this._stream.getTracks()[0].enabled = true;
       await this._context.resume();
+      info(`Context resumed, new state: ${this._context.state}`);
       this._active = true;
     }
   }
 
   public async stop() {
+    info(`Stopping recorder (active: ${this._active}, context state: ${this._context?.state}, track state: ${this._stream?.getTracks()[0]?.readyState})`);
     this._active = false;
     if (this._stream) {
       this._stream.getTracks()[0].enabled = false;
+      info(`Track disabled (new state: ${this._stream.getTracks()[0].readyState})`);
     }
-    await this._context?.suspend();
+    if (this._context && this._context.state === 'running') {
+      await this._context.suspend();
+      info(`Context suspended (new state: ${this._context.state})`);
+    }
   }
 
   public close() {

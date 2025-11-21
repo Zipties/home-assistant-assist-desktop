@@ -12,6 +12,7 @@ class RecorderProcessor extends AudioWorkletProcessor {
       int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
     }
 
+    // Send every chunk immediately (main thread buffers them)
     this.port.postMessage(int16Data);
 
     return true;

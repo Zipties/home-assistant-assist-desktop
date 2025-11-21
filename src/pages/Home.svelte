@@ -28,6 +28,7 @@
   let audio: HTMLAudioElement | undefined;
   let audioBuffer: Int16Array[] | undefined;
   let audioRecorder: AudioRecorder | undefined;
+  let recordingStartTime: number = 0;
   let homeAssistantClient: HomeAssistant;
   let homeAssistantConversationId: string | null;
   let homeAssistantCurrentPipeline: AssistPipeline | null;
@@ -197,7 +198,9 @@
         return;
       }
 
-      if (!audioRecorder?.active) startListening();
+      // Use toggle mode for hotkey too
+      info("Hotkey triggered, toggling recording");
+      toggleListening();
     };
 
     window.addEventListener("focus", handleFocus);
@@ -330,54 +333,146 @@
   }
 
   async function startListening(): Promise<void> {
-    // Clear input
-    text = "";
+    info("Starting recording (toggle mode)...");
 
-    // Disable input
-    inputElement.disabled = true;
-
-    // Scroll to bottom
+    // Show listening indicator
+    responses = [
+      ...responses,
+      { type: AssistResponseType.User, text: "🎤 Recording..." },
+    ];
     outputElement.scroll({
       top: outputElement.scrollHeight,
       behavior: "smooth",
     });
 
-    // Pre-create audio element during user gesture to satisfy autoplay policy
-    if (!audio) {
-      audio = new Audio();
-      audio.muted = true; // Start muted
-      info("Pre-created audio element during user gesture");
-    } else {
-      audio.pause();
-    }
+    // Initialize audio recorder if needed
     if (!audioRecorder) {
-      audioRecorder = new AudioRecorder((audio) => {
-        if (audioBuffer) audioBuffer.push(audio);
-        else sendAudioChunk(audio);
+      info("Creating new AudioRecorder");
+      audioRecorder = new AudioRecorder((chunk) => {
+        if (audioBuffer) {
+          audioBuffer.push(chunk);
+          // Log every 100 chunks to track audio flow
+          if (audioBuffer.length % 100 === 0) {
+            info(`Audio flowing: ${audioBuffer.length} chunks received`);
+          }
+        }
       });
+    } else {
+      info(`Reusing existing AudioRecorder (active: ${audioRecorder.active})`);
     }
-    sttBinaryHandlerId = null;
+
+    // Start buffering audio
     audioBuffer = [];
-    audioRecorder.start().then(() => {
-      responses = [
-        ...responses,
-        { type: AssistResponseType.User, text: "..." },
-      ];
-      // Scroll to bottom
-      outputElement.scroll({
-        top: outputElement.scrollHeight,
-        behavior: "smooth",
-      });
-    });
-    // To make sure the answer is placed at the right user text, we add it before we process it
+    recordingStartTime = Date.now();
+    await audioRecorder.start();
+    info(`Recording started (sample rate: ${audioRecorder.sampleRate}Hz), press again to stop`);
+  }
+
+  async function stopListening(): Promise<void> {
+    const recordingDuration = Date.now() - recordingStartTime;
+    info(`Stopping recording (duration: ${recordingDuration}ms)...`);
+
+    // Check minimum duration
+    if (recordingDuration < 300) {
+      error(`Recording too short (${recordingDuration}ms) - need at least 300ms`);
+      responses[responses.length - 1].text = "⚠️ Too quick! Hold F9 longer";
+      responses[responses.length - 1].type = AssistResponseType.Error;
+      audioBuffer = undefined;
+      try {
+        await audioRecorder?.stop();
+      } catch (err: any) {
+        error(`Error stopping recorder: ${err.message}`);
+      }
+      return;
+    }
+
     try {
+      await audioRecorder?.stop();
+    } catch (err: any) {
+      error(`Error stopping recorder: ${err.message}`);
+    }
+
+    // Save buffer reference and clear it immediately for next recording
+    const currentBuffer = audioBuffer;
+    audioBuffer = undefined;
+
+    if (!currentBuffer || currentBuffer.length === 0) {
+      error("No audio recorded");
+      responses[responses.length - 1].text = "No audio recorded (speak louder?)";
+      responses[responses.length - 1].type = AssistResponseType.Error;
+      return;
+    }
+
+    // Combine all audio chunks
+    const totalSamples = currentBuffer.reduce((sum, chunk) => sum + chunk.length, 0);
+    const combinedAudio = new Int16Array(totalSamples);
+    let offset = 0;
+    for (const chunk of currentBuffer) {
+      combinedAudio.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    info(`Recorded ${totalSamples} samples (${(totalSamples / audioRecorder.sampleRate!).toFixed(2)}s)`);
+
+    // Convert to WAV
+    const wavBlob = createWavBlob(combinedAudio, audioRecorder.sampleRate!);
+
+    // Send to Whisper API
+    try {
+      const formData = new FormData();
+      formData.append('file', wavBlob, 'audio.wav');
+      formData.append('model', 'whisper-1');
+
+      responses[responses.length - 1].text = "Transcribing...";
+
+      const response = await fetch('http://192.168.45.12:10400/audio/transcriptions', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(`Whisper API error: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      const transcription = data.text?.trim() || '';
+
+      info(`Transcribed: ${transcription}`);
+
+      if (transcription) {
+        // Update UI with transcription
+        responses[responses.length - 1].text = transcription;
+
+        // Send to Home Assistant for intent processing
+        info("Sending transcription to HA for intent...");
+        await sendToHomeAssistant(transcription);
+      } else {
+        responses[responses.length - 1].text = "No speech detected";
+        responses[responses.length - 1].type = AssistResponseType.Error;
+      }
+    } catch (err: any) {
+      error(`Transcription error: ${err.message}`);
+      responses[responses.length - 1].text = `Error: ${err.message}`;
+      responses[responses.length - 1].type = AssistResponseType.Error;
+    }
+
+    info("stopListening complete, ready for next recording");
+  }
+
+  // Send transcribed text to Home Assistant for intent processing
+  async function sendToHomeAssistant(transcribedText: string): Promise<void> {
+    try {
+      // Pre-create audio element for TTS response
+      if (!audio) {
+        audio = new Audio();
+        audio.muted = true;
+      }
+
       const unsub = await homeAssistantClient.runAssistPipeline(
         {
-          start_stage: "stt",
-          end_stage: homeAssistantCurrentPipeline?.tts_engine
-            ? "tts"
-            : "intent",
-          input: { sample_rate: audioRecorder.sampleRate! },
+          start_stage: "intent",
+          input: { text: transcribedText },
+          end_stage: homeAssistantCurrentPipeline?.tts_engine ? "tts" : "intent",
           pipeline:
             homeAssistantCurrentPipeline?.id ||
             homeAssistantPipelines.preferred_pipeline ||
@@ -385,27 +480,6 @@
           conversation_id: homeAssistantConversationId,
         },
         (event) => {
-          if (event.type === "run-start") {
-            sttBinaryHandlerId = event.data.runner_data.stt_binary_handler_id;
-          }
-
-          // When we start STT stage, the WS has a binary handler
-          if (event.type === "stt-start" && audioBuffer) {
-            // Send the buffer over the WS to the STT engine.
-            for (const buffer of audioBuffer) {
-              sendAudioChunk(buffer);
-            }
-            audioBuffer = undefined;
-          }
-
-          // Stop recording if the server is done with STT stage
-          if (event.type === "stt-end") {
-            sttBinaryHandlerId = null;
-            stopListening();
-            // To make sure the answer is placed at the right user text, we add it before we process it
-            responses[responses.length - 1].text = event.data.stt_output.text;
-          }
-
           if (event.type === "intent-end") {
             homeAssistantConversationId =
               event.data.intent_output.conversation_id;
@@ -423,14 +497,12 @@
               settings.home_assistant
             )}${event.data.tts_output.url}`;
 
-            // Use pre-created audio element (created during user gesture)
             if (!audio) {
               audio = new Audio();
               audio.muted = true;
             }
 
             info(`Loading TTS audio: ${url}`);
-            // Update src on existing audio element
             audio.src = url;
             audio.addEventListener("canplaythrough", playAudio, { once: true });
             audio.addEventListener("ended", unloadAudio, { once: true });
@@ -439,54 +511,65 @@
             audio.load();
           }
 
-          if (event.type === "run-end") {
-            sttBinaryHandlerId = null;
-            if (unsub) unsub();
-          }
-
           if (event.type === "error") {
-            sttBinaryHandlerId = null;
-            responses[responses.length - 1].text = event.data.message;
-            responses[responses.length - 1].type = AssistResponseType.Error;
-
-            stopListening();
+            responses = [
+              ...responses,
+              { type: AssistResponseType.Error, text: event.data.message },
+            ];
             if (unsub) unsub();
           }
 
-          let scrollCount = 0;
-          const scrollInterval = setInterval(() => {
-            outputElement.scroll({
-              top: outputElement.scrollHeight,
-              behavior: "smooth",
-            });
-            scrollCount++;
-            if (scrollCount > 5) clearInterval(scrollInterval);
-          }, 100);
+          if (event.type === "run-end") {
+            if (unsub) unsub();
+          }
 
-          // Clear input
-          inputElement.disabled = false;
-          inputElement.focus();
+          // Scroll to bottom
+          outputElement.scroll({
+            top: outputElement.scrollHeight,
+            behavior: "smooth",
+          });
         }
       );
     } catch (err: any) {
-      error(`Error starting pipeline: ${JSON.stringify({ err })}`);
-      stopListening();
+      error(`HA intent error: ${err.message}`);
+      responses = [
+        ...responses,
+        { type: AssistResponseType.Error, text: `HA error: ${err.message}` },
+      ];
     }
   }
 
-  function stopListening(): void {
-    audioRecorder?.stop();
-    if (sttBinaryHandlerId) {
-      if (audioBuffer) {
-        for (const chunk of audioBuffer) {
-          sendAudioChunk(chunk);
-        }
+  // Helper function to create WAV blob from Int16Array
+  function createWavBlob(samples: Int16Array, sampleRate: number): Blob {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+
+    // WAV header
+    const writeString = (offset: number, string: string) => {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
       }
-      // Send empty message to indicate we're done streaming.
-      sendAudioChunk(new Int16Array());
-      sttBinaryHandlerId = null;
-    }
-    audioBuffer = undefined;
+    };
+
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true); // fmt chunk size
+    view.setUint16(20, 1, true); // PCM format
+    view.setUint16(22, 1, true); // mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true); // byte rate
+    view.setUint16(32, 2, true); // block align
+    view.setUint16(34, 16, true); // bits per sample
+    writeString(36, 'data');
+    view.setUint32(40, samples.length * 2, true);
+
+    // Write audio data
+    const dataView = new Int16Array(buffer, 44);
+    dataView.set(samples);
+
+    return new Blob([buffer], { type: 'audio/wav' });
   }
 
   function sendAudioChunk(chunk: Int16Array): void {
@@ -517,8 +600,18 @@
       ];
       return;
     }
-    if (!audioRecorder?.active) startListening();
-    else stopListening();
+
+    // Debug logging
+    info(`Toggle called - audioRecorder: ${audioRecorder ? 'exists' : 'null'}, active: ${audioRecorder?.active}`);
+
+    // Toggle: if active, stop; if not active, start
+    if (audioRecorder?.active) {
+      info("Toggle: Stopping recording");
+      stopListening();
+    } else {
+      info("Toggle: Starting recording");
+      startListening();
+    }
   }
 
   function togglePipelineMenu(): void {
