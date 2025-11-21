@@ -350,6 +350,11 @@
       info("Creating new AudioRecorder");
       audioRecorder = new AudioRecorder((chunk) => {
         if (audioBuffer) {
+          // Log first chunk arrival to track delay
+          if (audioBuffer.length === 0) {
+            const delay = Date.now() - recordingStartTime;
+            info(`First chunk arrived (${chunk.length} samples, ${delay}ms after start)`);
+          }
           audioBuffer.push(chunk);
           // Log every 100 chunks to track audio flow
           if (audioBuffer.length % 100 === 0) {

@@ -34,6 +34,8 @@ export class AudioRecorder {
   }
 
   public async start() {
+    const startTime = Date.now();
+
     // Check if we need to recreate - either missing components OR components in bad state
     const needsRecreate =
       !this._context ||
@@ -58,10 +60,17 @@ export class AudioRecorder {
     } else {
       info(`Reusing existing audio context (state: ${this._context.state})`);
       this._active = true; // Set BEFORE resume to avoid dropping early chunks
+
+      const enableStart = Date.now();
       this._stream.getTracks()[0].enabled = true;
+      info(`Track enabled in ${Date.now() - enableStart}ms`);
+
+      const resumeStart = Date.now();
       await this._context.resume();
-      info(`Context resumed, new state: ${this._context.state}`);
+      info(`Context resumed in ${Date.now() - resumeStart}ms, new state: ${this._context.state}`);
     }
+
+    info(`AudioRecorder.start() completed in ${Date.now() - startTime}ms`);
   }
 
   public async stop() {
@@ -75,6 +84,11 @@ export class AudioRecorder {
       await this._context.suspend();
       info(`Context suspended (new state: ${this._context.state})`);
     }
+
+    // Wait briefly for any in-flight chunks to be processed and dropped
+    // This prevents stale chunks from previous recording appearing in next one
+    await new Promise(resolve => setTimeout(resolve, 50));
+    info(`Stop complete, stale chunks flushed`);
   }
 
   public close() {
