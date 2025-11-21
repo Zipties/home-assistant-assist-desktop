@@ -214,12 +214,20 @@
   });
 
   function playAudio(): void {
-    info("Playing audio..");
-    audio?.play();
+    info("Audio canplaythrough event - attempting to play...");
+    if (audio) {
+      // Workaround for webkit autoplay policy: unmute after starting muted
+      audio.muted = false;
+      audio.play()
+        .then(() => info("Audio playback started successfully"))
+        .catch((err) => error(`Audio play() failed: ${err.message}`));
+    }
   }
 
-  function audioError(): void {
-    error(`Audio error: ${JSON.stringify({ audio })}`);
+  function audioError(event: Event): void {
+    const audioEl = event.target as HTMLAudioElement;
+    error(`Audio error event - Code: ${audioEl?.error?.code}, Message: ${audioEl?.error?.message}`);
+    error(`Audio URL: ${audioEl?.src}`);
     unloadAudio();
   }
 
@@ -231,6 +239,13 @@
   async function callPipeline(): Promise<void> {
     // Disable input
     inputElement.disabled = true;
+
+    // Pre-create audio element during user gesture for TTS
+    if (!audio) {
+      audio = new Audio();
+      audio.muted = true;
+      info("Pre-created audio element for text input");
+    }
 
     // Set responses
     responses = [...responses, { type: AssistResponseType.User, text }];
@@ -279,13 +294,21 @@
           const url = `${generateHomeAssistantURLFromSettings(
             settings.home_assistant
           )}${event.data.tts_output.url}`;
-          audio = new Audio(url);
-          info(`Playing audio: ${url}`);
-          audio.play();
-          audio.addEventListener("ended", unloadAudio);
-          audio.addEventListener("pause", unloadAudio);
-          audio.addEventListener("canplaythrough", playAudio);
-          audio.addEventListener("error", audioError);
+
+          // Use pre-created audio element (created during user gesture)
+          if (!audio) {
+            audio = new Audio();
+            audio.muted = true;
+          }
+
+          info(`Loading TTS audio: ${url}`);
+          // Update src on existing audio element
+          audio.src = url;
+          audio.addEventListener("canplaythrough", playAudio, { once: true });
+          audio.addEventListener("ended", unloadAudio, { once: true });
+          audio.addEventListener("pause", unloadAudio, { once: true });
+          audio.addEventListener("error", audioError, { once: true });
+          audio.load();
         }
 
         let scrollCount = 0;
@@ -319,8 +342,14 @@
       behavior: "smooth",
     });
 
-    // Call voice pipeline
-    audio?.pause();
+    // Pre-create audio element during user gesture to satisfy autoplay policy
+    if (!audio) {
+      audio = new Audio();
+      audio.muted = true; // Start muted
+      info("Pre-created audio element during user gesture");
+    } else {
+      audio.pause();
+    }
     if (!audioRecorder) {
       audioRecorder = new AudioRecorder((audio) => {
         if (audioBuffer) audioBuffer.push(audio);
@@ -393,13 +422,21 @@
             const url = `${generateHomeAssistantURLFromSettings(
               settings.home_assistant
             )}${event.data.tts_output.url}`;
-            audio = new Audio(url);
-            info(`Playing audio: ${url}`);
-            audio.play();
-            audio.addEventListener("ended", unloadAudio);
-            audio.addEventListener("pause", unloadAudio);
-            audio.addEventListener("canplaythrough", playAudio);
-            audio.addEventListener("error", audioError);
+
+            // Use pre-created audio element (created during user gesture)
+            if (!audio) {
+              audio = new Audio();
+              audio.muted = true;
+            }
+
+            info(`Loading TTS audio: ${url}`);
+            // Update src on existing audio element
+            audio.src = url;
+            audio.addEventListener("canplaythrough", playAudio, { once: true });
+            audio.addEventListener("ended", unloadAudio, { once: true });
+            audio.addEventListener("pause", unloadAudio, { once: true });
+            audio.addEventListener("error", audioError, { once: true });
+            audio.load();
           }
 
           if (event.type === "run-end") {

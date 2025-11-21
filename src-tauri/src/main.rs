@@ -12,6 +12,8 @@ use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_log::LogTarget;
 use url::Url;
 
+// No longer needed - imports moved into the setup closure
+
 // Define settings
 #[derive(Serialize, Deserialize)]
 struct HomeAssistantSettings {
@@ -234,6 +236,28 @@ fn quit_application(window: tauri::Window) {
 }
 
 fn main() {
+    // Linux/Wayland: Fix for audio device access crash (Error 71 - Protocol error)
+    // CRITICAL: These environment variables MUST be set before GTK/webkit initialization
+    //
+    // Root cause: On Wayland + KDE Plasma + webkit2gtk, getUserMedia() was causing
+    // "Error 71 (Protocol error) dispatching to Wayland display" and hard crashing.
+    //
+    // Solution: Disable webkit's hardware compositing and DMA-BUF rendering, which
+    // cause Wayland protocol errors when accessing PipeWire audio devices.
+    // GTK_USE_PORTAL=1 forces proper XDG portal usage for media access.
+    //
+    // Fixed on: 2025-11-21 (Nobara 42, KDE Plasma 6.2, Wayland, webkit2gtk 0.18)
+    #[cfg(target_os = "linux")]
+    {
+        std::env::set_var("GTK_USE_PORTAL", "1");
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
+    // Check for CLI arguments (for triggering actions via KDE shortcuts on Wayland)
+    let args: Vec<String> = std::env::args().collect();
+    let trigger_voice = args.iter().any(|arg| arg == "--trigger-voice");
+
     let tray_menu: SystemTrayMenu = SystemTrayMenu::new()
         .add_item(CustomMenuItem::new(
             "toggle_window".to_string(),
@@ -241,7 +265,7 @@ fn main() {
         ))
         .add_item(CustomMenuItem::new(
             "trigger_voice_pipeline".to_string(),
-            "Trigger Voice Pipeline (Alt+Shift+A)",
+            "Trigger Voice Pipeline (Ctrl+Shift+A)",
         ))
         .add_native_item(SystemTrayMenuItem::Separator)
         .add_item(CustomMenuItem::new("open_settings".to_string(), "Settings"))
@@ -258,6 +282,15 @@ fn main() {
         .add_item(CustomMenuItem::new("quit_application".to_string(), "Quit"));
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            log::info!("Single instance triggered with args: {:?}", argv);
+
+            // Check if --trigger-voice flag is present
+            if argv.iter().any(|arg| arg == "--trigger-voice") {
+                let window = app.get_window("main").unwrap();
+                trigger_voice_pipeline(window);
+            }
+        }))
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             Some(vec![]),
@@ -326,20 +359,78 @@ fn main() {
             open_logs_directory,
             quit_application
         ])
-        .setup(|app: &mut tauri::App| {
+        .setup(move |app: &mut tauri::App| {
+            // Linux: Log environment status (env vars already set in main())
+            #[cfg(target_os = "linux")]
+            {
+                match std::env::var("XDG_RUNTIME_DIR") {
+                    Ok(dir) => log::info!("XDG_RUNTIME_DIR: {}", dir),
+                    Err(_) => log::warn!("XDG_RUNTIME_DIR not set - PipeWire access may fail"),
+                }
+
+                log::info!("Webkit Wayland compatibility flags enabled (GTK_USE_PORTAL=1)");
+            }
+
             let window = app.get_window("main").unwrap();
-            app.global_shortcut_manager()
+
+            // If --trigger-voice flag was passed, trigger the voice pipeline
+            if trigger_voice {
+                log::info!("CLI: Triggering voice pipeline from --trigger-voice flag");
+                trigger_voice_pipeline(window.clone());
+            }
+
+            // Linux: Auto-grant microphone/camera permissions
+            // With the webkit environment variables set at startup, auto-granting now works
+            // without causing Wayland protocol errors. This allows getUserMedia() to succeed.
+            #[cfg(target_os = "linux")]
+            {
+                use webkit2gtk::WebViewExt;
+                use webkit2gtk::SettingsExt;
+
+                window.with_webview(|webview| {
+                    let wv = webview.inner();
+
+                    // Enable autoplay for TTS audio responses
+                    if let Some(settings) = wv.settings() {
+                        settings.set_enable_media_stream(true);
+                        settings.set_enable_webaudio(true);
+                        settings.set_allow_modal_dialogs(true);
+                        log::info!("Enabled webkit media stream and webaudio");
+                    }
+
+                    wv.connect_permission_request(|_webview, request| {
+                        use webkit2gtk::glib::Cast;
+                        use webkit2gtk::UserMediaPermissionRequest;
+                        use webkit2gtk::PermissionRequestExt;
+
+                        if let Some(media_request) = request.downcast_ref::<UserMediaPermissionRequest>() {
+                            log::info!("Auto-granting microphone/camera permission request");
+                            media_request.allow();
+                            return true;
+                        }
+                        false
+                    });
+                }).unwrap();
+            }
+
+            // Try to register global shortcuts, but don't panic if they fail
+            // (might already be in use by another app)
+            if let Err(e) = app.global_shortcut_manager()
                 .register("Ctrl+Alt+A", move || {
                     toggle_window(window.clone());
                 })
-                .expect("failed to register Ctrl+Alt+A shortcut");
+            {
+                log::warn!("Could not register Ctrl+Alt+A shortcut: {}", e);
+            }
 
             let window = app.get_window("main").unwrap();
-            app.global_shortcut_manager()
-                .register("Alt+Shift+A", move || {
+            if let Err(e) = app.global_shortcut_manager()
+                .register("Ctrl+Shift+A", move || {
                     trigger_voice_pipeline(window.clone());
                 })
-                .expect("failed to register Alt+Shift+A shortcut");
+            {
+                log::warn!("Could not register Ctrl+Shift+A shortcut: {}", e);
+            }
 
             Ok(())
         })
