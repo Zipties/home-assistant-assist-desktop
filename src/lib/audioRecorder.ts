@@ -57,10 +57,10 @@ export class AudioRecorder {
       }
     } else {
       info(`Reusing existing audio context (state: ${this._context.state})`);
+      this._active = true; // Set BEFORE resume to avoid dropping early chunks
       this._stream.getTracks()[0].enabled = true;
       await this._context.resume();
       info(`Context resumed, new state: ${this._context.state}`);
-      this._active = true;
     }
   }
 
